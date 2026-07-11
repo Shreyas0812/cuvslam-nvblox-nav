@@ -1,0 +1,1 @@
+GPU-accelerated navigation bringup integrating NVIDIA Isaac ROS (cuVSLAM, nvblox) with Nav2 on ROS 2 Jazzy; this repo contains the launch, configuration, synchronization, and evaluation layers.
