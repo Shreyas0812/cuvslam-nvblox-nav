@@ -1,8 +1,11 @@
-# Phase 0 Setup Guide: cuVSLAM on GCP L4 (Isaac ROS release-4.5)
+# Setup Guide: cuVSLAM on GCP L4 (Isaac ROS release-4.5)
 
 Reproducible, from-scratch setup for running NVIDIA Isaac ROS cuVSLAM on a GCP
 Spot L4 instance, ending with a verified quickstart run and a reusable disk
 snapshot. Completed 2026-07-11 as Phase 0 of the `cuvslam-nvblox-nav` project.
+Updated 2026-07-14: added Docker Mode Configuration (section 6), which bakes
+the visual_slam packages into the dev image; current snapshot is
+`cuvslam-nvblox-nav-base-v2`.
 
 **Stack:** Ubuntu 24.04 / NVIDIA driver 610 (open) / Docker Engine 29 /
 nvidia-container-toolkit 1.19 / Isaac ROS release-4.5 (ROS 2 Jazzy) / cuVSLAM 15.0.0
@@ -12,7 +15,11 @@ cuVSLAM and nvblox themselves are NVIDIA's software, installed as prebuilt
 packages.
 
 **Cost model:** Spot g2-standard-8 runs ~$0.25–0.40/hr. The instance is
-deleted after every session; only the snapshot persists (~$0.10–0.15/month).
+deleted after every session; only the snapshot persists (v2 is ~25.7GB,
+roughly $0.70–1.30/month; see section 8 on trimming build cache).
+
+**Naming:** The instance name is pinned to `cuvslam-nvblox-nav` for all
+sessions so that recorded commands stay copy-pasteable.
 
 ---
 
@@ -27,15 +34,17 @@ guide months later.
    (unversioned "latest": https://nvidia-isaac-ros.github.io/getting_started/index.html)
 2. **isaac_ros_visual_slam Quickstart (release-4.5):**
    https://nvidia-isaac-ros.github.io/v/release-4.5/repositories_and_packages/isaac_ros_visual_slam/isaac_ros_visual_slam/index.html
-3. **NVIDIA CUDA Installation Guide for Linux (apt network repo / driver):**
+3. **Isaac ROS Development Environment / Docker Mode Configuration (release-4.5):**
+   https://nvidia-isaac-ros.github.io/v/release-4.5/concepts/dev_env/index.html
+4. **NVIDIA CUDA Installation Guide for Linux (apt network repo / driver):**
    https://docs.nvidia.com/cuda/cuda-installation-guide-linux/
-4. **Docker Engine install on Ubuntu:**
+5. **Docker Engine install on Ubuntu:**
    https://docs.docker.com/engine/install/ubuntu/
-5. **NVIDIA Container Toolkit install guide:**
+6. **NVIDIA Container Toolkit install guide:**
    https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
-6. **GCP: create Spot VM instances:**
+7. **GCP: create Spot VM instances:**
    https://cloud.google.com/compute/docs/instances/create-use-spot
-7. **GCP: create and manage disk snapshots:**
+8. **GCP: create and manage disk snapshots:**
    https://cloud.google.com/compute/docs/disks/create-snapshots
 
 System requirements from doc 1 (as of Jul 2026): x86_64 with Ampere or newer
@@ -77,11 +86,12 @@ for zone in $(gcloud compute machine-types list \
 done
 ```
 
-Record the winning zone; all later commands need it. This run landed in
-`us-central1-a`. Then SSH in (generates a key on first use):
+Record the winning zone; all later commands need it. The Phase 0 run landed
+in `us-central1-a`; the 2026-07-14 session landed in `us-west1-a`. Then SSH
+in (generates a key on first use):
 
 ```bash
-gcloud compute ssh cuvslam-nvblox-nav --zone=us-central1-a
+gcloud compute ssh cuvslam-nvblox-nav --zone=<zone>
 ```
 
 All commands in sections 2–6 run **on the instance**.
@@ -231,11 +241,96 @@ happens on first `isaac-ros activate`):
 sudo isaac-ros init docker
 ```
 
-## 6. cuVSLAM quickstart (Phase 0 verification)
+## 6. Bake project packages into the image (Docker Mode Configuration)
+
+Docs: [Isaac ROS Development Environment, "Custom Docker Image Layers"](https://nvidia-isaac-ros.github.io/v/release-4.5/concepts/dev_env/index.html)
+
+`isaac-ros activate` runs the dev container with removal on exit, so packages
+apt-installed inside it are lost when the container exits and are never
+captured by a disk snapshot. The CLI's documented fix is a custom Docker
+image layer: a thin `FROM ${BASE_IMAGE}` Dockerfile that the CLI chains on
+top of the NVIDIA-managed base image. This is not hand-rolling the Isaac ROS
+image; the base stays NVIDIA's, the layer only adds project packages.
+
+Three files, then one build. All paths are on the host.
+
+The Dockerfile layer (the `ARG BASE_IMAGE` / `FROM ${BASE_IMAGE}` pattern is
+required; the CLI sets it when chaining):
+
+```bash
+mkdir -p ${ISAAC_ROS_WS}/docker && cat > ${ISAAC_ROS_WS}/docker/Dockerfile.cuvslam_nav << 'EOF'
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG DEBIAN_FRONTEND=noninteractive
+ENV ROS_DISTRO=jazzy
+ENV ROS_ROOT=/opt/ros/${ROS_DISTRO}
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update \
+    && apt-get install -y \
+        ros-jazzy-isaac-ros-visual-slam \
+        ros-jazzy-isaac-ros-examples
+EOF
+```
+
+The Dockerfile search path. Trap: `CONFIG_DOCKER_SEARCH_DIRS` is
+first-match-wins, and if this file exists but omits
+`/etc/isaac-ros-cli/docker`, the CLI cannot find the base
+`Dockerfile.isaac_ros` and the build breaks. Both directories must be listed.
+The single-quoted heredoc keeps `${ISAAC_ROS_WS}` literal in the file; the
+CLI expands it at load time.
+
+```bash
+mkdir -p ${ISAAC_ROS_WS}/scripts && cat > ${ISAAC_ROS_WS}/scripts/.isaac_ros_common-config << 'EOF'
+CONFIG_DOCKER_SEARCH_DIRS=(${ISAAC_ROS_WS}/docker /etc/isaac-ros-cli/docker)
+EOF
+```
+
+Register the image key at workspace scope. Put nothing else in this file; the
+CLI merges it with the system config, and duplicating unrelated config here
+can break activation.
+
+```bash
+mkdir -p ${ISAAC_ROS_WS}/.isaac-ros-cli && cat > ${ISAAC_ROS_WS}/.isaac-ros-cli/config.yaml << 'EOF'
+docker:
+  image:
+    additional_image_keys:
+      - cuvslam_nav
+EOF
+```
+
+Build the composed image (several minutes; the apt install dominates):
+
+```bash
+isaac-ros activate --build-local
+```
+
+Watch the early output for the resolved image key list; it should show
+`['isaac_ros', 'cuvslam_nav']`. On this and every subsequent activate, a line
+like `Error response from daemon: failed to resolve reference
+"nvcr.io/nvidia/isaac/ros:isaac_ros-cuvslam_nav_...": not found` is expected
+and harmless: the CLI checks the NGC registry for the composed tag, misses
+because the image is local-only, and uses the local image.
+
+Verify persistence, which is the entire point. Exit the container, re-enter
+with no build flag, and confirm the packages are present in a fresh
+container:
+
+```bash
+exit
+isaac-ros activate
+ros2 pkg list | grep -E "isaac_ros_visual_slam|isaac_ros_examples"
+```
+
+Expected: `isaac_ros_examples`, `isaac_ros_visual_slam`,
+`isaac_ros_visual_slam_interfaces`. Verified 2026-07-14; the subsequent
+quickstart run (section 7) reproduced ~32.5 Hz odometry from the baked
+packages with zero in-container installs.
+
+## 7. cuVSLAM quickstart (verification)
 
 Docs: [isaac_ros_visual_slam Quickstart](https://nvidia-isaac-ros.github.io/v/release-4.5/repositories_and_packages/isaac_ros_visual_slam/isaac_ros_visual_slam/index.html)
 
-### 6.1 Download quickstart assets (host)
+### 7.1 Download quickstart assets (host)
 
 Prerequisites:
 
@@ -280,25 +375,18 @@ versions/$LATEST_VERSION_ID/files/$NGC_FILENAME" && \
 fi
 ```
 
-### 6.2 Enter the managed environment
+### 7.2 Enter the managed environment
 
-First run pulls the Isaac ROS dev image (~2.3GB) and drops you into a
-container shell as `admin`, with the host workspace mounted at
-`/workspaces/isaac_ros-dev`:
+Drops you into a container shell as `admin`, with the host workspace mounted
+at `/workspaces/isaac_ros-dev`. The visual_slam and examples packages are
+already present from the section 6 image layer; no in-container installs are
+needed.
 
 ```bash
 isaac-ros activate
 ```
 
-### 6.3 Install packages (inside the container)
-
-Binary-package route from the quickstart:
-
-```bash
-sudo apt-get update && sudo apt-get install -y ros-jazzy-isaac-ros-visual-slam ros-jazzy-isaac-ros-examples
-```
-
-### 6.4 Run — three terminals
+### 7.3 Run — three terminals
 
 **Terminal 1** (inside container): launch cuVSLAM. It loads the graph
 (expect `cuVSLAM version: 15.0.0`, `Tracking mode: Multicamera`) and waits
@@ -336,16 +424,26 @@ ros2 bag play ${ISAAC_ROS_WS}/isaac_ros_assets/isaac_ros_visual_slam/quickstart_
 ```
 
 **Pass criterion:** terminal 2 shows a steady rate with no tracking errors in
-terminal 1. This run measured ~32 Hz:
+terminal 1. Phase 0 measured ~32.3 Hz; the 2026-07-14 rerun from baked
+packages measured ~32.5 Hz:
 
 ```
-average rate: 32.321
-    min: 0.003s max: 0.050s std dev: 0.00985s window: 33
+average rate: 32.512
+    min: 0.005s max: 0.052s std dev: 0.01103s window: 50
 ```
 
-## 7. Snapshot and teardown
+## 8. Snapshot and teardown
 
 Docs: [GCP disk snapshots](https://cloud.google.com/compute/docs/disks/create-snapshots)
+
+Optional, before snapshotting: `isaac-ros activate --build-local` leaves
+buildx build cache on disk, which the snapshot faithfully captures. Pruning
+it shrinks the snapshot (v2 was taken without pruning and came out ~25.7GB,
+much of it cache):
+
+```bash
+docker builder prune -f
+```
 
 Shut down cleanly (Ctrl+C the launch and monitor, `exit` out of container
 shells), then from the local machine:
@@ -353,48 +451,64 @@ shells), then from the local machine:
 Stop the instance so the snapshot captures a quiesced disk:
 
 ```bash
-gcloud compute instances stop cuvslam-nvblox-nav --zone=us-central1-a
+gcloud compute instances stop cuvslam-nvblox-nav --zone=<zone>
 ```
 
 Snapshot to US multi-region storage, so one snapshot can create disks in any
-US zone (no per-region copying needed):
+US zone (no per-region copying needed). Bump the version suffix each time the
+environment changes:
 
 ```bash
-gcloud compute snapshots create cuvslam-nvblox-nav-base \
+gcloud compute snapshots create cuvslam-nvblox-nav-base-v2 \
   --source-disk=cuvslam-nvblox-nav \
-  --source-disk-zone=us-central1-a \
+  --source-disk-zone=<zone> \
   --storage-location=us
 ```
 
 Verify it reports READY:
 
 ```bash
-gcloud compute snapshots describe cuvslam-nvblox-nav-base --format="value(status,diskSizeGb,storageBytes,storageLocations)"
+gcloud compute snapshots describe cuvslam-nvblox-nav-base-v2 --format="value(status,diskSizeGb,storageBytes,storageLocations)"
 ```
 
-Optional but recommended once: prove the snapshot by restoring it. A GPU is
-not needed to verify disk contents, so a small CPU instance costs about a
-cent and also rehearses the restore path every future session uses.
+Prove the snapshot by restoring it before trusting it and before deleting any
+predecessor snapshot. A GPU is not needed to verify disk contents, so a small
+CPU instance costs about a cent and also rehearses the restore path every
+future session uses. The check covers the composed image and the section 6
+config files, which are what distinguish v2 from a bare Phase 0 disk:
 
 ```bash
 gcloud compute instances create snapshot-test \
-  --zone=us-central1-a \
+  --zone=<zone> \
   --machine-type=e2-medium \
-  --source-snapshot=cuvslam-nvblox-nav-base
+  --source-snapshot=cuvslam-nvblox-nav-base-v2
 
-gcloud compute ssh snapshot-test --zone=us-central1-a --command="docker images && ls ~/workspaces/isaac_ros-dev/isaac_ros_assets"
+gcloud compute ssh snapshot-test --zone=<zone> --command="docker images | grep cuvslam_nav; cat ~/workspaces/isaac_ros-dev/.isaac-ros-cli/config.yaml; cat ~/workspaces/isaac_ros-dev/scripts/.isaac_ros_common-config; ls ~/workspaces/isaac_ros-dev/isaac_ros_assets"
 
-gcloud compute instances delete snapshot-test --zone=us-central1-a --quiet
+gcloud compute instances delete snapshot-test --zone=<zone> --quiet
 ```
+
+A content check cannot prove GPU behavior; the first `isaac-ros activate` on
+the next GPU session is the full end-to-end proof. Delete the predecessor
+snapshot only after one of the two proofs has passed (v1 was deleted
+2026-07-14 after the content check, accepting that residual gap).
 
 Delete the GPU instance (its boot disk goes with it; the snapshot is the
 persistent copy):
 
 ```bash
-gcloud compute instances delete cuvslam-nvblox-nav --zone=us-central1-a --quiet
+gcloud compute instances delete cuvslam-nvblox-nav --zone=<zone> --quiet
 ```
 
-## 8. Known issues and lessons learned
+Verify the shutdown:
+
+```bash
+gcloud compute instances list
+```
+
+Expected: `Listed 0 items.`
+
+## 9. Known issues and lessons learned
 
 **cuVSLAM rejects non-monotonic timestamps.** Playing a bag a second time
 against a running node produces a wall of
@@ -404,28 +518,34 @@ play per node lifetime. Restart the launch (or call the
 `/visual_slam/reset` service) before any replay. This applies equally to
 custom bags in later phases.
 
-**The dev container is ephemeral.** `isaac-ros activate` runs the container
-with removal on exit, so packages apt-installed *inside* it (section 6.3) do
-not survive an instance stop and are **not** in the snapshot. The image, host
-setup, and workspace assets are. Consequence: after restoring from this
-snapshot, rerun the section 6.3 install once. The proper fix is the CLI's
-Docker Mode Configuration
-(https://nvidia-isaac-ros.github.io/concepts/dev_env/index.html), which bakes
-extra packages into the image; do that, verify a launch, and take a v2
-snapshot.
+**The dev container is ephemeral; fixed by section 6.** `isaac-ros activate`
+runs the container with removal on exit, so packages apt-installed inside it
+do not survive and are not in any snapshot. As of v2 the visual_slam and
+examples packages are baked into the composed image via Docker Mode
+Configuration, so no post-activate installs are needed. Any future
+in-container apt install is still ephemeral: to persist a new package, add it
+to `Dockerfile.cuvslam_nav`, rerun `isaac-ros activate --build-local`, and
+take a new snapshot.
+
+**NGC registry miss on activate is expected.** Every activate prints
+`failed to resolve reference "nvcr.io/nvidia/isaac/ros:isaac_ros-cuvslam_nav_...": not found`
+because the composed tag exists only locally. The CLI falls back to the local
+image. Harmless.
 
 **Spot capacity is volatile.** us-east4 zones a and c were stocked out and
-us-east4-b does not offer G2 machines at all; us-central1-a worked on the
-first try. A stopped Spot GPU instance is not a reservation (restart can fail
-on capacity) and it still counts against regional GPU quota while stopped.
-With `GPUS_ALL_REGIONS = 1`, a parked stopped instance also blocks creating a
-GPU instance anywhere else. Hence the create-from-snapshot / delete-after-
-session workflow.
+us-east4-b does not offer G2 machines at all; us-central1-a and us-west1-a
+have both worked on the first try in different sessions. A stopped Spot GPU
+instance is not a reservation (restart can fail on capacity) and it still
+counts against regional GPU quota while stopped. With `GPUS_ALL_REGIONS = 1`,
+a parked stopped instance also blocks creating a GPU instance anywhere else.
+Hence the create-from-snapshot / delete-after-session workflow.
 
-**Sizes for planning:** Isaac ROS dev image ~2.3GB, quickstart assets
-~612MB, snapshot storage ~5.2GB after this full setup.
+**Sizes for planning:** Isaac ROS dev image ~2.3GB, composed local image
+~19.7GB reported (~6.45GB unique), quickstart assets ~612MB. v1 snapshot was
+~5.2GB; v2 is ~25.7GB, much of it buildx cache that `docker builder prune`
+would have removed (section 8).
 
-## 9. Resuming a session from the snapshot
+## 10. Resuming a session from the v2 snapshot
 
 ```bash
 # Create instance from snapshot (loop zones as in section 1, replacing
@@ -433,16 +553,18 @@ session workflow.
 gcloud compute instances create cuvslam-nvblox-nav \
   --zone=<zone-with-capacity> \
   --machine-type=g2-standard-8 \
-  --source-snapshot=cuvslam-nvblox-nav-base \
+  --source-snapshot=cuvslam-nvblox-nav-base-v2 \
   --boot-disk-type=pd-balanced \
   --provisioning-model=SPOT \
   --instance-termination-action=STOP
 
 gcloud compute ssh cuvslam-nvblox-nav --zone=<zone>
+nvidia-smi   # confirm the driver came up before touching Docker
 isaac-ros activate
-# Until the v2 snapshot exists, reinstall in-container packages:
-sudo apt-get update && sudo apt-get install -y ros-jazzy-isaac-ros-visual-slam ros-jazzy-isaac-ros-examples
+# No package reinstall needed; the image carries them. Sanity check:
+ros2 pkg list | grep -E "isaac_ros_visual_slam|isaac_ros_examples"
 ```
 
 End of session, always: push code to GitHub, pull artifacts off the
-instance, re-snapshot if the environment changed, delete the instance.
+instance, re-snapshot if the environment changed, delete the instance, and
+verify with `gcloud compute instances list` showing zero instances.
