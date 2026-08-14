@@ -6,3 +6,7 @@ rosbags/
 build/
 install/
 log/
+
+# Local rosbag test data 
+data/bags/*
+!data/bags/.gitkeep
